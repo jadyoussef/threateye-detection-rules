@@ -1,0 +1,144 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule Name:    Detection - Microsoft Defender 'RoguePlanet' zero-day grants SYSTEM privileges
+// Author:       ThreatEye CTI Platform
+// Created:      2026-06-10
+// Platform:     Microsoft Sentinel (KQL)
+// Severity:     High
+// MITRE:        N/A
+// Threat Actor: Microsoft Defender for Endpoint
+// CVEs:         N/A
+// Description:  A security researcher known as Nightmare Eclipse has publicly released a proof-of-concept exploit named "RoguePlanet" targeting a race condition vulne
+// References:   N/A
+// ─────────────────────────────────────────────────────────────────────────────
+```kql
+// Detect potential RoguePlanet exploit activity targeting Microsoft Defender race condition vulnerability
+// This query looks for suspicious process activity, Defender service manipulation, and exploit indicators
+// across SecurityEvent and Syslog tables
+
+let SuspiciousProcessNames = dynamic([
+    "rogueplanet", "rogue_planet", "rogue-planet", "nightmare_eclipse",
+    "defender_exploit", "wdexploit", "mpexploit", "mpclient_exploit"
+]);
+
+let SuspiciousCommandPatterns = dynamic([
+    "MpClient.dll", "MsMpEng.exe", "WdFilter.sys", "mpengine.dll",
+    "WinDefend", "SecurityHealthService", "wscsvc"
+]);
+
+// Check Windows Security Events for suspicious process creation (Event ID 4688)
+let WindowsProcessEvents = SecurityEvent
+| where TimeGenerated > ago(7d)
+// Focus on process creation events
+| where EventID == 4688
+// Look for suspicious executable names matching known exploit tool names
+| where tolower(NewProcessName) has_any (SuspiciousProcessNames)
+    or tolower(CommandLine) has_any (SuspiciousProcessNames)
+    // Detect attempts to interact with Defender internals via command line
+    or (tolower(CommandLine) has "MsMpEng" and tolower(CommandLine) has_any ("inject", "exploit", "race", "bypass", "patch"))
+    // Detect suspicious child processes spawned from Defender components
+    or (tolower(ParentProcessName) has "msmpeng" and tolower(NewProcessName) has_any ("cmd", "powershell", "wscript", "cscript", "mshta", "rundll32", "regsvr32"))
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    SubjectUserName,
+    SubjectDomainName,
+    NewProcessName,
+    ParentProcessName,
+    CommandLine,
+    EventID,
+    Activity,
+    Source = "SecurityEvent-ProcessCreation";
+
+// Check for Defender service tampering or privilege escalation (Event IDs 4697, 7045, 4703)
+let DefenderServiceTampering = SecurityEvent
+| where TimeGenerated > ago(7d)
+// Service installation or modification events
+| where EventID in (4697, 7045, 4703, 4704, 4705)
+// Look for modifications to Defender-related services
+| where tolower(ServiceName) has_any ("windefend", "wdfilter", "wdnisdrv", "wdnissvc", "securityhealthservice", "mpssvc")
+    or tolower(ServiceFileName) has_any ("msmpeng", "mpcmdrun", "mpengine", "wdfilter")
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    SubjectUserName,
+    SubjectDomainName,
+    ServiceName,
+    ServiceFileName,
+    EventID,
+    Activity,
+    Source = "SecurityEvent-ServiceTampering";
+
+// Detect privilege escalation attempts that may follow successful exploit (Event ID 4672, 4673)
+let PrivilegeEscalation = SecurityEvent
+| where TimeGenerated > ago(7d)
+// Special privileges assigned or sensitive privilege use
+| where EventID in (4672, 4673)
+// Focus on non-standard accounts gaining elevated privileges
+| where SubjectUserName !endswith "$"
+    and SubjectUserName !in ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    // Look for high-value privilege assignments indicative of post-exploit activity
+    and PrivilegeList has_any ("SeDebugPrivilege", "SeLoadDriverPrivilege", "SeTcbPrivilege", "SeCreateTokenPrivilege", "SeImpersonatePrivilege")
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    SubjectUserName,
+    SubjectDomainName,
+    PrivilegeList,
+    EventID,
+    Activity,
+    Source = "SecurityEvent-PrivilegeEscalation";
+
+// Check Syslog for Linux-based exploit activity or cross-platform indicators
+let SyslogExploitActivity = Syslog
+| where TimeGenerated > ago(7d)
+// Look for exploit tool names in syslog messages
+| where tolower(SyslogMessage) has_any (SuspiciousProcessNames)
+    or (tolower(SyslogMessage) has "defender" and tolower(SyslogMessage) has_any ("exploit", "race condition", "bypass", "inject"))
+| project
+    TimeGenerated,
+    Computer,
+    HostName,
+    ProcessName,
+    SyslogMessage,
+    Facility,
+    SeverityLevel,
+    Source = "Syslog-ExploitActivity";
+
+// Detect suspicious PowerShell or script-based Defender manipulation (Event ID 4104 - Script Block Logging)
+let PowerShellDefenderManipulation = SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID == 4104
+// Detect scripts attempting to disable or manipulate Defender
+| where tolower(CommandLine) has_any (
+    "set-mppreference",
+    "add-mppreference",
+    "remove-mppreference",
+    "disablerealtimemonitoring",
+    "disablebehaviormonitoring",
+    "disableioavprotection",
+    "disablescriptscanning",
+    "exclusionpath",
+    "exclusionprocess"
+    )
+    // Combined with exploit-related keywords
+    and tolower(CommandLine) has_any (SuspiciousProcessNames)
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    SubjectUserName,
+    CommandLine,
+    EventID,
+    Activity,
+    Source = "SecurityEvent-PSDefenderManipulation";
+
+// Combine all detection streams and present unified results
+WindowsProcessEvents
+| union DefenderServiceTampering
+| union PrivilegeEscalation
+| union SyslogExploitActivity
+| union PowerShellDefenderManipulation
+// Sort by most recent events first for triage
