@@ -1,0 +1,130 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule Name:    Detection - CISA Adds Cisco, Chrome, and Arista Flaws to KEV Catalog Amid Active Exploitatio
+// Author:       ThreatEye CTI Platform
+// Created:      2026-06-10
+// Platform:     Microsoft Sentinel (KQL)
+// Severity:     High
+// MITRE:        N/A
+// Threat Actor: Palo Alto Networks NGFW
+// CVEs:         N/A
+// Description:  CISA has added three actively exploited vulnerabilities to its Known Exploited Vulnerabilities (KEV) catalog, requiring immediate remediation action f
+// References:   N/A
+// ─────────────────────────────────────────────────────────────────────────────
+```kql
+// Detect exploitation attempts related to CISA KEV CVEs: CVE-2026-20245, CVE-2026-11645, CVE-2026-7473
+// These CVEs affect Cisco Catalyst SD-WAN Manager and related systems
+// Detection focuses on suspicious process execution, privilege escalation, and network anomalies
+
+let SuspiciousProcesses = dynamic([
+    "cmd.exe", "powershell.exe", "bash", "sh", "python", "perl",
+    "wget", "curl", "nc", "netcat", "ncat"
+]);
+
+let CVEKeywords = dynamic([
+    "CVE-2026-20245", "CVE-2026-11645", "CVE-2026-7473",
+    "sd-wan", "sdwan", "vmanage", "catalyst"
+]);
+
+// Check SecurityEvent for suspicious local privilege escalation or arbitrary code execution
+let SecurityEventAlerts = SecurityEvent
+| where TimeGenerated > ago(24h)
+// Focus on process creation events (EventID 4688) and privilege use (EventID 4672, 4673)
+| where EventID in (4688, 4672, 4673, 4698, 4702, 7045)
+| extend ProcessName = tostring(split(NewProcessName, "\\")[-1])
+// Look for suspicious processes that may indicate exploitation
+| where ProcessName in~ (SuspiciousProcesses)
+    or CommandLine has_any (CVEKeywords)
+    or CommandLine matches regex @"(?i)(exec|system|popen|subprocess|os\.system)"
+// Exclude known benign administrative accounts
+| where not(SubjectUserName has_any ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"))
+| project
+    TimeGenerated,
+    Computer,
+    EventID,
+    SubjectUserName,
+    SubjectDomainName,
+    ProcessName,
+    NewProcessName,
+    CommandLine,
+    ParentProcessName,
+    LogonId,
+    Source = "SecurityEvent",
+    DetectionReason = strcat("Suspicious process execution detected. EventID: ", tostring(EventID));
+
+// Check Syslog for Linux/Unix-based exploitation indicators (SD-WAN appliances often run Linux)
+let SyslogAlerts = Syslog
+| where TimeGenerated > ago(24h)
+// Focus on authentication, sudo usage, and process execution logs
+| where Facility in ("auth", "authpriv", "daemon", "kern", "user")
+    or SyslogMessage has_any (CVEKeywords)
+// Detect privilege escalation attempts via sudo or su
+| where SyslogMessage matches regex @"(?i)(sudo|su\s|privilege|escalat|unauthorized|exploit|arbitrary|command injection)"
+    or SyslogMessage has_any (CVEKeywords)
+    or (SyslogMessage has "COMMAND" and SyslogMessage has_any (SuspiciousProcesses))
+| project
+    TimeGenerated,
+    Computer,
+    HostName,
+    ProcessName,
+    SyslogMessage,
+    Facility,
+    SeverityLevel,
+    Source = "Syslog",
+    DetectionReason = "Syslog indicates potential exploitation or privilege escalation activity";
+
+// Check CommonSecurityLog for network-based exploitation attempts targeting SD-WAN
+let CSLAlerts = CommonSecurityLog
+| where TimeGenerated > ago(24h)
+// Look for CVE references in device vendor/product fields related to Cisco SD-WAN
+| where DeviceVendor has_any ("Cisco", "cisco")
+    or DeviceProduct has_any ("SD-WAN", "vManage", "Catalyst", "sdwan")
+    or Message has_any (CVEKeywords)
+    or Activity has_any (CVEKeywords)
+// Detect suspicious activity types: exploitation, scanning, unauthorized access
+| where Activity has_any ("exploit", "attack", "unauthorized", "injection", "overflow", "traversal")
+    or Message has_any ("exploit", "CVE-2026-20245", "CVE-2026-11645", "CVE-2026-7473", "arbitrary code", "privilege escalation")
+    or DeviceAction has_any ("exploit", "attack", "block", "deny")
+| project
+    TimeGenerated,
+    Computer,
+    DeviceVendor,
+    DeviceProduct,
+    DeviceAction,
+    SourceIP,
+    DestinationIP,
+    SourceUserName,
+    Activity,
+    Message,
+    LogSeverity,
+    Source = "CommonSecurityLog",
+    DetectionReason = "Network device log indicates potential CVE exploitation attempt";
+
+// Union all detection sources and present unified results
+SecurityEventAlerts
+| union SyslogAlerts
+| union CSLAlerts
+// Sort by most recent events first
+| sort by TimeGenerated desc
+| project
+    TimeGenerated,
+    Source,
+    Computer,
+    DetectionReason,
+    SourceIP = iif(Source == "CommonSecurityLog", tostring(column_ifexists("SourceIP", "")), ""),
+    DestinationIP = iif(Source == "CommonSecurityLog", tostring(column_ifexists("DestinationIP", "")), ""),
+    UserName = coalesce(
+        tostring(column_ifexists("SubjectUserName", "")),
+        tostring(column_ifexists("SourceUserName", ""))
+    ),
+    ProcessOrActivity = coalesce(
+        tostring(column_ifexists("ProcessName", "")),
+        tostring(column_ifexists("Activity", ""))
+    ),
+    CommandOrMessage = coalesce(
+        tostring(column_ifexists("CommandLine", "")),
+        tostring(column_ifexists("SyslogMessage", "")),
+        tostring(column_ifexists("Message", ""))
+    ),
+    DeviceVendor = tostring(column_ifexists("DeviceVendor", "")),
+    DeviceProduct = tostring(column_ifexists("DeviceProduct", ""))
+```
